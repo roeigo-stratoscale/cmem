@@ -50,6 +50,9 @@ SECRET_PATTERNS = [
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
     r"xox[abpr]-[A-Za-z0-9-]{10,}",
     r"(?i)\b(password|passwd|pwd|token|secret|api[_-]?key)\b\s*[:=]\s*['\"`]?(?!<)[^\s'\"`]{8,}",
+    r"sshpass\s+-p\s+(?!<|\$|\"\$|'?[A-Z_]+'?\s)\S+",
+    # A quoted argument that looks like a generated secret: 12+ chars mixing upper, lower and digits.
+    r"'(?=[^'\s]*[A-Z])(?=[^'\s]*[a-z])(?=[^'\s]*\d)[A-Za-z0-9+/_=-]{16,}'",
 ]
 
 APPLY = False
@@ -351,14 +354,14 @@ def cmd_sync(args):
             link.symlink_to(path)
 
 
-def scan(root, patterns):
+def scan(root, patterns, allowed=()):
     hits = []
     for path in sorted(root.rglob("*")) if root and root.is_dir() else []:
         if ".git" in path.parts or ".obsidian" in path.parts or not path.is_file() or path.name == "workplace.json":
             continue
         for number, line in enumerate(path.read_text(errors="ignore").splitlines(), 1):
             for pattern in patterns:
-                if re.search(pattern, line):
+                if re.search(pattern, line) and not any(ok in line for ok in allowed):
                     hits.append(f"{rel(path)}:{number}: {line.strip()[:120]}")
                     break
     return hits
@@ -367,7 +370,10 @@ def scan(root, patterns):
 def cmd_check(args):
     internal = workplace_info()["internal_patterns"]
     problems = [f"internal name in general layer  {hit}" for hit in scan(GENERAL, internal)]
-    problems += [f"possible secret  {hit}" for layer in (GENERAL, WORKPLACE) for hit in scan(layer, SECRET_PATTERNS)]
+    # workplace.json "reviewed_secrets": exact fragments a person decided may stay in the workplace layer only.
+    reviewed = workplace_info().get("reviewed_secrets", [])
+    problems += [f"possible secret  {hit}" for hit in scan(GENERAL, SECRET_PATTERNS)]
+    problems += [f"possible secret  {hit}" for hit in scan(WORKPLACE, SECRET_PATTERNS, reviewed)]
     print("\n".join(problems) if problems else "check: clean")
     return not problems
 

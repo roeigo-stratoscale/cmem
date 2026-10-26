@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""cmem: Claude Code memory, remember-plugin notes, lessons and skills in two git-backed layers.
+
+Layers (configured in ~/.config/cmem/config.json):
+  general    ~/claude-memory            personal; clean lessons and skills that travel with you
+  workplace  ~/claude-memory-<name>     the current workplace; full-detail lessons and skills,
+                                        plus all per-repo memory (keyed by GitHub owner/repo)
+
+The same lesson or skill name can exist in both layers; the workplace version wins.
+Leaving a workplace = drop its layer, and the general versions take over.
+
+    cmem link [DIR] [--all]   link a checkout's memory and remember notes into the workplace layer
+    cmem skills               move personal skills from ~/.claude/skills into the workplace layer
+    cmem promote FILE...      move a project memory file into the workplace lessons (loads in every repo)
+    cmem sync                 rebuild ~/.claude/cmem/lessons.md and the skill links (workplace wins)
+    cmem check                scan the general layer for internal names and both layers for secrets
+    cmem status               show layers, winners and unlinked memory
+    cmem backup [-m MSG]      check, then commit and push both layers
+    cmem restore              new machine: config, remember mode, git ignore, skills, link --all, sync
+
+Commands that change files only print what they would do unless given --apply.
+"""
+import argparse
+import datetime
+import filecmp
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG_FILE = HOME / ".config" / "cmem" / "config.json"
+CLAUDE_DIR = HOME / ".claude"
+CLAUDE_PROJECTS = CLAUDE_DIR / "projects"
+CLAUDE_SKILLS = CLAUDE_DIR / "skills"
+CLAUDE_MD = CLAUDE_DIR / "CLAUDE.md"
+LESSONS_INDEX = CLAUDE_DIR / "cmem" / "lessons.md"
+REMEMBER_HOME = HOME / ".remember"
+BACKUP_DIR = HOME / ".cmem-backup" / datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+IMPORT_LINE = "@~/.claude/cmem/lessons.md"
+SKIP_SKILLS = {"synced", ".trash"}
+REMEMBER_LOCAL_DIRS = {"logs", "tmp", "run"}
+SECRET_PATTERNS = [
+    r"session=eyJ[\w=.-]{20,}",
+    r"gh[pousr]_[A-Za-z0-9]{30,}",
+    r"AKIA[0-9A-Z]{16}",
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+    r"xox[abpr]-[A-Za-z0-9-]{10,}",
+    r"(?i)\b(password|passwd|pwd|token|secret|api[_-]?key)\b\s*[:=]\s*['\"`]?(?!<)[^\s'\"`]{8,}",
+]
+
+APPLY = False
+
+
+def say(msg):
+    print(("" if APPLY else "[dry-run] ") + msg)
+
+
+def load_config():
+    if CONFIG_FILE.exists():
+        config = json.loads(CONFIG_FILE.read_text())
+    else:
+        config = {"general": "~/claude-memory", "workplace": os.environ.get("CMEM_WORKPLACE")}
+    general = Path(os.path.expanduser(config["general"]))
+    workplace = Path(os.path.expanduser(config["workplace"])) if config.get("workplace") else None
+    return general, workplace
+
+
+GENERAL, WORKPLACE = load_config()
+
+
+def workplace_info():
+    if not WORKPLACE or not (WORKPLACE / "workplace.json").exists():
+        return {"name": None, "internal_patterns": []}
+    return json.loads((WORKPLACE / "workplace.json").read_text())
+
+
+def rel(path):
+    for root in (WORKPLACE, GENERAL):
+        if root and str(path).startswith(str(root)):
+            return f"{root.name}/{Path(path).relative_to(root)}"
+    return str(path).replace(str(HOME), "~")
+
+
+def slug_for(path):
+    """Same slug Claude Code uses for ~/.claude/projects/<slug>/."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
+
+
+def repo_key(checkout):
+    result = subprocess.run(["git", "-C", str(checkout), "remote", "get-url", "origin"],
+                            capture_output=True, text=True)
+    match = re.search(r"github\.com[:/]+([^/]+)/([^/]+?)(?:\.git)?/?$", result.stdout.strip())
+    return f"{match.group(1).lower()}/{match.group(2).lower()}" if match else None
+
+
+def store_dir_for(checkout):
+    checkout = Path(checkout).resolve()
+    if checkout == HOME:
+        return WORKPLACE / "global" / "home", "home"
+    key = repo_key(checkout) if (checkout / ".git").exists() else None
+    if key:
+        return WORKPLACE / "repos" / key, key
+    return WORKPLACE / "paths" / slug_for(checkout), f"path:{checkout}"
+
+
+def backup_copy(path):
+    if not APPLY or not path.exists() or path.is_symlink():
+        return
+    target = BACKUP_DIR / path.relative_to(HOME)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_dir():
+        shutil.copytree(path, target, symlinks=True)
+    else:
+        shutil.copy2(path, target)
+
+
+def merge_index(src, dst):
+    """MEMORY.md: keep dst's lines, append src lines that are not already there."""
+    have = dst.read_text().splitlines()
+    extra = [line for line in src.read_text().splitlines() if line.strip() and line not in have]
+    if extra:
+        say(f"  merge {len(extra)} new index line(s) into {rel(dst)}")
+        if APPLY:
+            dst.write_text("\n".join(have + extra) + "\n")
+
+
+def merge_dir(src, dst, origin, notes=False):
+    """Copy src's files into dst. Never overwrite: same name, different content is kept side by side."""
+    for item in sorted(src.iterdir()):
+        if (notes and item.name in REMEMBER_LOCAL_DIRS) or item.name in (".gitignore", ".install-marker"):
+            continue
+        target = dst / item.name
+        if item.is_dir():
+            if APPLY:
+                target.mkdir(parents=True, exist_ok=True)
+            merge_dir(item, target, origin, notes)
+        elif not target.exists():
+            say(f"  add {rel(target)}")
+            if APPLY:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(item, target)
+        elif filecmp.cmp(item, target, shallow=False):
+            continue
+        elif item.name == "MEMORY.md":
+            merge_index(item, target)
+        elif notes and item.suffix == ".md":
+            say(f"  append {item.name} from {origin} to {rel(target)}")
+            if APPLY:
+                with target.open("a") as out:
+                    out.write(f"\n\n<!-- merged from {origin} -->\n{item.read_text()}")
+        else:
+            side = target.with_name(f"{target.stem}.from-{slug_for(origin)[-40:]}{target.suffix}")
+            say(f"  CONFLICT {item.name}: different content, kept as {rel(side)}")
+            if APPLY:
+                shutil.copy2(item, side)
+
+
+def link_one(link_path, store_path, origin, notes=False):
+    """Make link_path a symlink to store_path, merging whatever is at link_path first."""
+    if link_path.is_symlink():
+        if link_path.resolve() == store_path.resolve():
+            return
+        say(f"relink {rel(link_path)} (was -> {os.readlink(link_path)})")
+        if APPLY:
+            link_path.unlink()
+    elif link_path.exists():
+        say(f"merge {rel(link_path)} -> {rel(store_path)}")
+        if APPLY:
+            store_path.mkdir(parents=True, exist_ok=True)
+        merge_dir(link_path, store_path, origin, notes)
+        backup_copy(link_path)
+        if APPLY:
+            shutil.rmtree(link_path)
+    else:
+        say(f"link {rel(link_path)} -> {rel(store_path)}")
+    if APPLY:
+        store_path.mkdir(parents=True, exist_ok=True)
+        link_path.parent.mkdir(parents=True, exist_ok=True)
+        link_path.symlink_to(store_path)
+
+
+def link_checkout(checkout):
+    checkout = Path(checkout).resolve()
+    store, key = store_dir_for(checkout)
+    slug = slug_for(checkout)
+    print(f"== {rel(checkout)}  [{key}]")
+    link_one(CLAUDE_PROJECTS / slug / "memory", store / "memory", str(checkout))
+    legacy = checkout / ".remember"
+    if legacy.is_dir() and not legacy.is_symlink() and checkout != HOME:
+        say(f"merge legacy {rel(legacy)} -> {rel(store / 'remember')}")
+        if APPLY:
+            (store / "remember").mkdir(parents=True, exist_ok=True)
+        merge_dir(legacy, store / "remember", str(checkout), notes=True)
+        backup_copy(legacy)
+        if APPLY:
+            shutil.rmtree(legacy)
+    link_one(REMEMBER_HOME / slug, store / "remember", str(checkout), notes=True)
+
+
+def home_remember():
+    """The home dir's legacy remember store is ~/.remember itself (notes at its root)."""
+    store = WORKPLACE / "global" / "home" / "remember"
+    for note in sorted(REMEMBER_HOME.glob("*.md")) if REMEMBER_HOME.is_dir() else []:
+        target = store / note.name
+        if target.exists() and filecmp.cmp(note, target, shallow=False):
+            continue
+        say(f"move ~/.remember/{note.name} -> {rel(target)}")
+        backup_copy(note)
+        if APPLY:
+            store.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                with target.open("a") as out:
+                    out.write(f"\n\n<!-- merged from ~/.remember -->\n{note.read_text()}")
+            else:
+                shutil.copy2(note, target)
+            note.unlink()
+
+
+def discover_checkouts():
+    found = []
+    for root in sorted(HOME.glob("work*")):
+        for candidate in sorted(root.glob("*")) + sorted(root.glob("*/.worktrees/*")):
+            if (candidate / ".git").exists():
+                found.append(candidate)
+    return found
+
+
+def guess_key_for_orphan(slug, known):
+    """-home-alice-work2-shop -> acme/shop when exactly one known repo has that name."""
+    if re.fullmatch(r"-(home|Users)-[^-]+", slug):
+        return "home"
+    tail = re.sub(r"^-(home|Users)-[^-]+-(work\d*-)?", "", slug).lower()
+    hits = sorted({k for k in known if k.split("/")[1] == tail})
+    return hits[0] if len(hits) == 1 else None
+
+
+def cmd_link(args):
+    if not args.all:
+        link_checkout(args.dir or os.getcwd())
+        return
+    known, linked = set(), set()
+    home_remember()
+    link_checkout(HOME)
+    linked.add(slug_for(HOME))
+    for checkout in discover_checkouts():
+        key = repo_key(checkout)
+        if key:
+            known.add(key)
+        slug = slug_for(checkout.resolve())
+        # Only checkouts Claude was used in; the SessionStart hook links new ones on first use.
+        if (CLAUDE_PROJECTS / slug).is_dir() or (checkout / ".remember").is_dir():
+            link_checkout(checkout)
+            linked.add(slug)
+    for proj in sorted(CLAUDE_PROJECTS.iterdir()):
+        mem = proj / "memory"
+        if proj.name in linked or "private-var" in proj.name or not mem.is_dir() or mem.is_symlink():
+            continue
+        if not any(mem.iterdir()):
+            continue
+        key = guess_key_for_orphan(proj.name, known)
+        store = {"home": WORKPLACE / "global" / "home", None: WORKPLACE / "orphans" / proj.name}.get(
+            key, WORKPLACE / "repos" / str(key))
+        print(f"== orphan {proj.name}  [{key or 'unmatched'}]")
+        link_one(mem, store / "memory", proj.name)
+
+
+def cmd_skills(args):
+    for skill in sorted(CLAUDE_SKILLS.iterdir()):
+        if skill.name in SKIP_SKILLS or skill.is_symlink() or not skill.is_dir():
+            continue
+        print(f"== skill {skill.name}")
+        link_one(skill, WORKPLACE / "skills" / skill.name, f"skills/{skill.name}")
+
+
+def cmd_promote(args):
+    """Move project memory files into the workplace lessons and drop their project index lines."""
+    lessons = WORKPLACE / "lessons"
+    for name in args.files:
+        source = Path(name).expanduser()
+        target = lessons / source.name
+        if target.exists() and not filecmp.cmp(source, target, shallow=False):
+            say(f"SKIP {source.name}: a different lesson with this name exists in {rel(lessons)}")
+            continue
+        say(f"promote {rel(source)} -> {rel(target)}")
+        index = source.parent / "MEMORY.md"
+        if APPLY:
+            lessons.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            source.unlink()
+            if index.exists():
+                kept = [l for l in index.read_text().splitlines() if f"({source.name})" not in l]
+                index.write_text("\n".join(kept) + "\n")
+
+
+def winners(kind):
+    """name -> path; workplace overrides general."""
+    result = {}
+    for layer in (GENERAL, WORKPLACE):
+        folder = layer / kind if layer else None
+        if folder and folder.is_dir():
+            for item in sorted(folder.iterdir()):
+                if item.name.startswith("."):
+                    continue
+                if kind == "lessons" and item.suffix != ".md":
+                    continue
+                result[item.stem if kind == "lessons" else item.name] = item
+    return result
+
+
+def cmd_sync(args):
+    lessons = winners("lessons")
+    lines = ["<!-- Generated by `cmem sync`. Edit the lesson files, not this file. -->",
+             f"# Lessons ({workplace_info()['name'] or 'general'} layer wins over general on the same name)", ""]
+    lines += [f"@{str(path).replace(str(HOME), '~')}" for _, path in sorted(lessons.items())]
+    content = "\n".join(lines) + "\n"
+    if not LESSONS_INDEX.exists() or LESSONS_INDEX.read_text() != content:
+        say(f"write {rel(LESSONS_INDEX)} ({len(lessons)} lessons)")
+        if APPLY:
+            LESSONS_INDEX.parent.mkdir(parents=True, exist_ok=True)
+            LESSONS_INDEX.write_text(content)
+    current = CLAUDE_MD.read_text() if CLAUDE_MD.exists() else ""
+    if IMPORT_LINE not in current:
+        say(f"add {IMPORT_LINE} to {rel(CLAUDE_MD)}")
+        if APPLY:
+            CLAUDE_MD.write_text(current + ("\n" if current and not current.endswith("\n") else "")
+                                 + "# Lessons that apply in every project (managed by cmem)\n" + IMPORT_LINE + "\n")
+    skills = winners("skills")
+    for link in sorted(CLAUDE_SKILLS.iterdir()) if CLAUDE_SKILLS.is_dir() else []:
+        # A link cmem made (into some claude-memory*/skills/) whose layer no longer provides it.
+        target = Path(os.readlink(link)) if link.is_symlink() else None
+        if target and target.parent.name == "skills" and target.parent.parent.name.startswith("claude-memory") \
+                and link.name not in skills:
+            say(f"remove skill link {link.name} (no layer provides it now)")
+            if APPLY:
+                link.unlink()
+    for name, path in skills.items():
+        link = CLAUDE_SKILLS / name
+        if link.is_symlink() and link.resolve() == path.resolve():
+            continue
+        if link.exists() and not link.is_symlink():
+            say(f"SKIP skill {name}: {rel(link)} is a real folder, run `cmem skills` first")
+            continue
+        say(f"skill {name} -> {rel(path)}")
+        if APPLY:
+            if link.is_symlink():
+                link.unlink()
+            link.symlink_to(path)
+
+
+def scan(root, patterns):
+    hits = []
+    for path in sorted(root.rglob("*")) if root and root.is_dir() else []:
+        if ".git" in path.parts or ".obsidian" in path.parts or not path.is_file() or path.name == "workplace.json":
+            continue
+        for number, line in enumerate(path.read_text(errors="ignore").splitlines(), 1):
+            for pattern in patterns:
+                if re.search(pattern, line):
+                    hits.append(f"{rel(path)}:{number}: {line.strip()[:120]}")
+                    break
+    return hits
+
+
+def cmd_check(args):
+    internal = workplace_info()["internal_patterns"]
+    problems = [f"internal name in general layer  {hit}" for hit in scan(GENERAL, internal)]
+    problems += [f"possible secret  {hit}" for layer in (GENERAL, WORKPLACE) for hit in scan(layer, SECRET_PATTERNS)]
+    print("\n".join(problems) if problems else "check: clean")
+    return not problems
+
+
+def cmd_status(args):
+    info = workplace_info()
+    print(f"general   {GENERAL}\nworkplace {WORKPLACE} ({info['name']})")
+    for kind in ("lessons", "skills"):
+        for name, path in sorted(winners(kind).items()):
+            layer = "workplace" if WORKPLACE and str(path).startswith(str(WORKPLACE)) else "general"
+            both = GENERAL and WORKPLACE and (GENERAL / kind / path.name).exists() and (WORKPLACE / kind / path.name).exists()
+            print(f"{kind[:-1]:6} {name:45} {layer}{' (overrides general)' if both else ''}")
+    for proj in sorted(CLAUDE_PROJECTS.iterdir()):
+        mem = proj / "memory"
+        if mem.is_dir() and not mem.is_symlink() and any(mem.iterdir()) and "private-var" not in proj.name:
+            print(f"NOT LINKED {proj.name}")
+
+
+def cmd_backup(args):
+    if not cmd_check(args):
+        print("Refusing to back up. Fix the lines above, then run again.")
+        sys.exit(1)
+    for layer in (GENERAL, WORKPLACE):
+        git = ["git", "-C", str(layer)]
+        subprocess.run(git + ["add", "-A"], check=True)
+        if subprocess.run(git + ["diff", "--cached", "--quiet"]).returncode:
+            subprocess.run(git + ["commit", "-q", "-m", args.message], check=True)
+            print(f"{layer.name}: committed")
+        if subprocess.run(git + ["remote"], capture_output=True, text=True).stdout.strip():
+            subprocess.run(git + ["push", "-q"], check=True)
+            print(f"{layer.name}: pushed")
+        else:
+            print(f"{layer.name}: no remote")
+
+
+def cmd_restore(args):
+    global WORKPLACE
+    if args.workplace:
+        WORKPLACE = Path(os.path.expanduser(args.workplace))
+    if not CONFIG_FILE.exists() or args.workplace:
+        say(f"write {rel(CONFIG_FILE)}")
+        if APPLY:
+            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            CONFIG_FILE.write_text(json.dumps({"general": str(GENERAL).replace(str(HOME), "~"),
+                                               "workplace": str(WORKPLACE).replace(str(HOME), "~") if WORKPLACE else None},
+                                              indent=2) + "\n")
+    remember_config = REMEMBER_HOME / "config.json"
+    current = json.loads(remember_config.read_text()) if remember_config.exists() else {}
+    if current.get("data_dir") != "~/.remember/{slug}":
+        say(f"set data_dir=~/.remember/{{slug}} in {rel(remember_config)} (remember external storage mode)")
+        if APPLY:
+            REMEMBER_HOME.mkdir(exist_ok=True)
+            remember_config.write_text(json.dumps({**current, "data_dir": "~/.remember/{slug}"}, indent=2) + "\n")
+    ignore = HOME / ".config" / "git" / "ignore"
+    if ".remember/" not in (ignore.read_text() if ignore.exists() else ""):
+        say(f"add .remember/ to {rel(ignore)}")
+        if APPLY:
+            ignore.parent.mkdir(parents=True, exist_ok=True)
+            with ignore.open("a") as out:
+                out.write(".remember/\n")
+    if WORKPLACE:
+        cmd_skills(args)
+        args.all, args.dir = True, None
+        cmd_link(args)
+    cmd_sync(args)
+
+
+def main():
+    global APPLY
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    link = sub.add_parser("link")
+    link.add_argument("dir", nargs="?")
+    link.add_argument("--all", action="store_true")
+    promote = sub.add_parser("promote")
+    promote.add_argument("files", nargs="+")
+    for name in ("skills", "sync", "check", "status"):
+        sub.add_parser(name)
+    restore = sub.add_parser("restore")
+    restore.add_argument("--workplace", help="path of the workplace layer clone, e.g. ~/claude-memory-<name>")
+    backup = sub.add_parser("backup")
+    backup.add_argument("-m", "--message", default=f"cmem backup {datetime.date.today()}")
+    for p in sub.choices.values():
+        p.add_argument("--apply", action="store_true")
+        p.add_argument("--quiet", action="store_true")
+    args = parser.parse_args()
+    APPLY = args.apply or args.cmd in ("backup", "check", "status")
+    if args.quiet:
+        sys.stdout = open(os.devnull, "w")
+    needs_workplace = args.cmd in ("link", "skills", "promote")
+    if needs_workplace and not WORKPLACE:
+        print("No workplace layer configured; nothing to link.")
+        return
+    commands = {"link": cmd_link, "skills": cmd_skills, "promote": cmd_promote, "sync": cmd_sync,
+                "check": cmd_check, "status": cmd_status, "backup": cmd_backup, "restore": cmd_restore}
+    ok = commands[args.cmd](args)
+    if APPLY and BACKUP_DIR.exists():
+        print(f"Originals copied to {BACKUP_DIR}")
+    if args.cmd == "check" and not ok:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

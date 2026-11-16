@@ -17,12 +17,18 @@ Leaving a workplace = drop its layer, and the general versions take over.
     cmem status               show layers, winners and unlinked memory
     cmem backup [-m MSG]      check, then commit and push both layers
     cmem restore              new machine: config, remember mode, git ignore, skills, link --all, sync
+    cmem config               show or set the layer folders (--general, --workplace, 'none' drops one)
+    cmem init-layer KIND PATH create a layer's layout; only adds what is missing
+    cmem doctor [--json]      what is set up and what is missing (what /cmem:setup walks through)
+    cmem remove               undo cmem here: links become real folders, CLAUDE.md block removed
+    cmem session-start        what the plugin's SessionStart hook runs (silent unless not set up)
 
 Commands that change files only print what they would do unless given --apply.
 """
 import argparse
 import datetime
 import filecmp
+import glob
 import json
 import os
 import re
@@ -41,6 +47,15 @@ LESSONS_INDEX = CLAUDE_DIR / "cmem" / "lessons.md"
 REMEMBER_HOME = HOME / ".remember"
 BACKUP_DIR = HOME / ".cmem-backup" / datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 IMPORT_LINE = "@~/.claude/cmem/lessons.md"
+# cmem owns only the text between these markers in ~/.claude/CLAUDE.md; other tools' blocks and the
+# user's own rules stay untouched.
+BLOCK_BEGIN = "<!-- BEGIN cmem: managed by cmem, do not edit; `cmem remove` takes it out -->"
+BLOCK_END = "<!-- END cmem -->"
+BLOCK_RE = re.compile(r"<!-- BEGIN cmem\b.*?<!-- END cmem -->\n?", re.S)
+OLD_BLOCK = "# Lessons that apply in every project (managed by cmem)\n" + IMPORT_LINE + "\n"
+LAYER_MARKER = ".cmem-layer"
+DEFAULT_CHECKOUT_ROOTS = ["~/work*", "~/src", "~/code", "~/projects", "~/git", "~/repos"]
+LAYER_GITIGNORE = ".obsidian/\n.DS_Store\n**/logs/\n**/tmp/\n**/run/\n"
 SKIP_SKILLS = {"synced", ".trash"}
 REMEMBER_LOCAL_DIRS = {"logs", "tmp", "run"}
 SECRET_PATTERNS = [
@@ -63,16 +78,48 @@ def say(msg):
 
 
 def load_config():
+    """Either layer may be missing: a teammate can run with only a workplace layer, or only a general one."""
     if CONFIG_FILE.exists():
         config = json.loads(CONFIG_FILE.read_text())
-    else:
+    elif os.environ.get("CMEM_WORKPLACE") or (HOME / "claude-memory").is_dir():
+        # Installs from before `cmem config` existed had no config file.
         config = {"general": "~/claude-memory", "workplace": os.environ.get("CMEM_WORKPLACE")}
-    general = Path(os.path.expanduser(config["general"]))
-    workplace = Path(os.path.expanduser(config["workplace"])) if config.get("workplace") else None
-    return general, workplace
+    else:
+        config = {}
+
+    def layer_path(key):
+        return Path(os.path.expanduser(config[key])) if config.get(key) else None
+
+    return layer_path("general"), layer_path("workplace"), config
 
 
-GENERAL, WORKPLACE = load_config()
+GENERAL, WORKPLACE, CONFIG = load_config()
+
+
+def configured():
+    return bool(GENERAL or WORKPLACE)
+
+
+def layers():
+    return [layer for layer in (GENERAL, WORKPLACE) if layer]
+
+
+def home_path(path):
+    """~/... for paths under the home folder (also when given its resolved form), else unchanged."""
+    text = str(path)
+    for home in (str(HOME), str(HOME.resolve())):
+        if text == home or text.startswith(home + os.sep):
+            return "~" + text[len(home):]
+    return text
+
+
+def inside_a_layer(path):
+    """True for a path inside a configured layer or inside any folder marked as a cmem layer."""
+    path = Path(path)
+    if any(str(path).startswith(str(layer.resolve()) + os.sep) or str(path).startswith(str(layer) + os.sep)
+           for layer in layers()):
+        return True
+    return any((parent / LAYER_MARKER).exists() for parent in path.parents)
 
 
 def workplace_info():
@@ -85,7 +132,7 @@ def rel(path):
     for root in (WORKPLACE, GENERAL):
         if root and str(path).startswith(str(root)):
             return f"{root.name}/{Path(path).relative_to(root)}"
-    return str(path).replace(str(HOME), "~")
+    return home_path(path)
 
 
 def slug_for(path):
@@ -223,9 +270,17 @@ def home_remember():
             note.unlink()
 
 
+def checkout_roots():
+    roots = []
+    for pattern in CONFIG.get("checkout_roots", DEFAULT_CHECKOUT_ROOTS):
+        expanded = os.path.expanduser(pattern)
+        roots += sorted(Path(match) for match in glob.glob(expanded))
+    return [root for root in roots if root.is_dir()]
+
+
 def discover_checkouts():
     found = []
-    for root in sorted(HOME.glob("work*")):
+    for root in checkout_roots():
         for candidate in sorted(root.glob("*")) + sorted(root.glob("*/.worktrees/*")):
             if (candidate / ".git").exists():
                 found.append(candidate)
@@ -258,7 +313,7 @@ def cmd_link(args):
         if (CLAUDE_PROJECTS / slug).is_dir() or (checkout / ".remember").is_dir():
             link_checkout(checkout)
             linked.add(slug)
-    for proj in sorted(CLAUDE_PROJECTS.iterdir()):
+    for proj in sorted(CLAUDE_PROJECTS.iterdir()) if CLAUDE_PROJECTS.is_dir() else []:
         mem = proj / "memory"
         if proj.name in linked or "private-var" in proj.name or not mem.is_dir() or mem.is_symlink():
             continue
@@ -314,29 +369,58 @@ def winners(kind):
     return result
 
 
+def link_target(link):
+    """Absolute target of a symlink (relative links are relative to the link's folder), or None."""
+    if not link.is_symlink():
+        return None
+    target = Path(os.readlink(link))
+    return Path(os.path.normpath(target if target.is_absolute() else link.parent / target))
+
+
+def claude_md_text():
+    return CLAUDE_MD.read_text() if CLAUDE_MD.exists() else ""
+
+
+def without_cmem_block(text):
+    return BLOCK_RE.sub("", text.replace(OLD_BLOCK, ""))
+
+
+def ensure_claude_md_block():
+    """Keep exactly one cmem block in ~/.claude/CLAUDE.md, replacing the unmarked lines older versions added."""
+    current = claude_md_text()
+    block = f"{BLOCK_BEGIN}\n{IMPORT_LINE}\n{BLOCK_END}\n"
+    if BLOCK_RE.search(current) and OLD_BLOCK not in current:
+        wanted = BLOCK_RE.sub(lambda _: block, current, count=1)
+    else:
+        rest = without_cmem_block(current)
+        wanted = rest + ("\n" if rest and not rest.endswith("\n") else "") + block
+    if wanted != current:
+        say(f"write the cmem block in {rel(CLAUDE_MD)}")
+        if APPLY:
+            CLAUDE_MD.parent.mkdir(parents=True, exist_ok=True)
+            CLAUDE_MD.write_text(wanted)
+
+
 def cmd_sync(args):
     lessons = winners("lessons")
     lines = ["<!-- Generated by `cmem sync`. Edit the lesson files, not this file. -->",
              f"# Lessons ({workplace_info()['name'] or 'general'} layer wins over general on the same name)", ""]
-    lines += [f"@{str(path).replace(str(HOME), '~')}" for _, path in sorted(lessons.items())]
+    lines += [f"@{home_path(path)}" for _, path in sorted(lessons.items())]
     content = "\n".join(lines) + "\n"
     if not LESSONS_INDEX.exists() or LESSONS_INDEX.read_text() != content:
         say(f"write {rel(LESSONS_INDEX)} ({len(lessons)} lessons)")
         if APPLY:
             LESSONS_INDEX.parent.mkdir(parents=True, exist_ok=True)
             LESSONS_INDEX.write_text(content)
-    current = CLAUDE_MD.read_text() if CLAUDE_MD.exists() else ""
-    if IMPORT_LINE not in current:
-        say(f"add {IMPORT_LINE} to {rel(CLAUDE_MD)}")
-        if APPLY:
-            CLAUDE_MD.write_text(current + ("\n" if current and not current.endswith("\n") else "")
-                                 + "# Lessons that apply in every project (managed by cmem)\n" + IMPORT_LINE + "\n")
+    ensure_claude_md_block()
     skills = winners("skills")
     for link in sorted(CLAUDE_SKILLS.iterdir()) if CLAUDE_SKILLS.is_dir() else []:
-        # A link cmem made (into some claude-memory*/skills/) whose layer no longer provides it.
-        target = Path(os.readlink(link)) if link.is_symlink() else None
-        if target and target.parent.name == "skills" and target.parent.parent.name.startswith("claude-memory") \
-                and link.name not in skills:
+        # A link cmem made (into some layer's skills/) whose layer no longer provides it.
+        target = link_target(link)
+        # Links other tools made (often relative, sometimes dangling) are never touched.
+        made_by_cmem = target and target.parent.name == "skills" and (
+            inside_a_layer(target) or target.parent.parent.name.startswith("claude-memory"))
+        if made_by_cmem and link.name not in skills:
             say(f"remove skill link {link.name} (no layer provides it now)")
             if APPLY:
                 link.unlink()
@@ -351,6 +435,7 @@ def cmd_sync(args):
         if APPLY:
             if link.is_symlink():
                 link.unlink()
+            CLAUDE_SKILLS.mkdir(parents=True, exist_ok=True)
             link.symlink_to(path)
 
 
@@ -386,7 +471,7 @@ def cmd_status(args):
             layer = "workplace" if WORKPLACE and str(path).startswith(str(WORKPLACE)) else "general"
             both = GENERAL and WORKPLACE and (GENERAL / kind / path.name).exists() and (WORKPLACE / kind / path.name).exists()
             print(f"{kind[:-1]:6} {name:45} {layer}{' (overrides general)' if both else ''}")
-    for proj in sorted(CLAUDE_PROJECTS.iterdir()):
+    for proj in sorted(CLAUDE_PROJECTS.iterdir()) if CLAUDE_PROJECTS.is_dir() else []:
         mem = proj / "memory"
         if mem.is_dir() and not mem.is_symlink() and any(mem.iterdir()) and "private-var" not in proj.name:
             print(f"NOT LINKED {proj.name}")
@@ -396,7 +481,7 @@ def cmd_backup(args):
     if not cmd_check(args):
         print("Refusing to back up. Fix the lines above, then run again.")
         sys.exit(1)
-    for layer in (GENERAL, WORKPLACE):
+    for layer in layers():
         git = ["git", "-C", str(layer)]
         subprocess.run(git + ["add", "-A"], check=True)
         if subprocess.run(git + ["diff", "--cached", "--quiet"]).returncode:
@@ -417,9 +502,8 @@ def cmd_restore(args):
         say(f"write {rel(CONFIG_FILE)}")
         if APPLY:
             CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-            CONFIG_FILE.write_text(json.dumps({"general": str(GENERAL).replace(str(HOME), "~"),
-                                               "workplace": str(WORKPLACE).replace(str(HOME), "~") if WORKPLACE else None},
-                                              indent=2) + "\n")
+            write_config({**CONFIG, "general": home_path(GENERAL) if GENERAL else None,
+                          "workplace": home_path(WORKPLACE) if WORKPLACE else None})
     remember_config = REMEMBER_HOME / "config.json"
     current = json.loads(remember_config.read_text()) if remember_config.exists() else {}
     if current.get("data_dir") != "~/.remember/{slug}":
@@ -441,6 +525,223 @@ def cmd_restore(args):
     cmd_sync(args)
 
 
+def write_config(config):
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps({key: value for key, value in config.items() if value is not None},
+                                      indent=2) + "\n")
+
+
+def cmd_config(args):
+    """Set which folders are the layers. `--workplace none` drops the workplace layer (e.g. after leaving a job)."""
+    config = dict(CONFIG)
+    for key in ("general", "workplace"):
+        value = getattr(args, key)
+        if value is not None:
+            config[key] = None if value.lower() == "none" else home_path(Path(os.path.expanduser(value)).absolute())
+    if args.checkout_root:
+        config["checkout_roots"] = args.checkout_root
+    if not args.general and not args.workplace and not args.checkout_root:
+        print(json.dumps(config, indent=2))
+        return
+    say(f"write {rel(CONFIG_FILE)}: {json.dumps({k: v for k, v in config.items() if v is not None})}")
+    if APPLY:
+        write_config(config)
+
+
+def write_new(path, content):
+    """Create a file only when it is missing; never overwrite what a person wrote."""
+    if path.exists():
+        return
+    say(f"create {home_path(path)}")
+    if APPLY:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+
+def github_owners_of_checkouts():
+    owners = {}
+    for checkout in discover_checkouts():
+        key = repo_key(checkout)
+        if key:
+            owner = key.split("/")[0]
+            owners[owner] = owners.get(owner, 0) + 1
+    return sorted(owners, key=lambda owner: -owners[owner])
+
+
+def cmd_init_layer(args):
+    """Create a layer's folder layout. Safe on an existing layer: it only adds what is missing."""
+    path = Path(os.path.expanduser(args.path)).absolute()
+    if args.kind == "general":
+        readme = ("# Personal memory layer (cmem general layer)\n\nLessons and skills with no internal names "
+                  "of any employer or customer. This repo travels with you between jobs.\n\n"
+                  "- `lessons/`: loaded in every Claude Code session\n- `skills/`: linked into ~/.claude/skills\n")
+    else:
+        readme = (f"# Workplace memory layer: {args.name}\n\nFull-detail lessons and skills for this workplace, "
+                  "and per-repo memory under `repos/<owner>/<repo>/`. On the same name, this layer wins over "
+                  "the general layer.\n")
+    write_new(path / "README.md", readme)
+    write_new(path / ".gitignore", LAYER_GITIGNORE)
+    write_new(path / LAYER_MARKER, args.kind + "\n")
+    for folder in ("lessons", "skills") + (("repos",) if args.kind == "workplace" else ()):
+        write_new(path / folder / ".gitkeep", "")
+    if args.kind == "workplace":
+        owners = args.owner or []
+        patterns = sorted({re.escape(word.lower()) for word in owners + [args.name] if word})
+        write_new(path / "workplace.json", json.dumps({
+            "name": args.name, "github_owners": owners,
+            "internal_patterns": [f"(?i){pattern}" for pattern in patterns],
+            "reviewed_secrets": []}, indent=2) + "\n")
+    if not (path / ".git").exists():
+        say(f"git init {home_path(path)}")
+        if APPLY:
+            subprocess.run(["git", "init", "-q", "-b", "main", str(path)], check=True)
+    if args.remote:
+        has_origin = (path / ".git").exists() and subprocess.run(
+            ["git", "-C", str(path), "remote", "get-url", "origin"], capture_output=True).returncode == 0
+        if not has_origin:
+            say(f"add remote origin {args.remote}")
+            if APPLY:
+                subprocess.run(["git", "-C", str(path), "remote", "add", "origin", args.remote], check=True)
+
+
+def remember_installed():
+    installed = CLAUDE_DIR / "plugins" / "installed_plugins.json"
+    try:
+        return any(key.startswith("remember@") for key in json.loads(installed.read_text()).get("plugins", {}))
+    except (OSError, ValueError):
+        return False
+
+
+def running_as_plugin():
+    return str(CLAUDE_DIR / "plugins") in str(Path(__file__).resolve())
+
+
+def doctor_items():
+    """Everything setup can fix. status: ok, missing (setup should offer it), optional, warn."""
+    items = []
+
+    def add(key, status, detail, fix=""):
+        items.append({"key": key, "status": status, "detail": detail, "fix": fix})
+
+    add("config", "ok" if CONFIG_FILE.exists() else "missing", home_path(CONFIG_FILE),
+        "cmem config --general PATH [--workplace PATH] --apply")
+    for kind, layer in (("general", GENERAL), ("workplace", WORKPLACE)):
+        if not layer:
+            add(f"{kind}-layer", "optional" if kind == "workplace" or WORKPLACE else "missing",
+                "not configured", f"cmem init-layer {kind} PATH --apply, then cmem config --{kind} PATH --apply")
+            continue
+        if not layer.is_dir():
+            add(f"{kind}-layer", "missing", f"{home_path(layer)} does not exist",
+                f"clone it there, or cmem init-layer {kind} {home_path(layer)} --apply")
+            continue
+        has_layout = (layer / LAYER_MARKER).exists() and (kind == "general" or (layer / "workplace.json").exists())
+        add(f"{kind}-layer", "ok" if has_layout else "missing", home_path(layer),
+            f"cmem init-layer {kind} {home_path(layer)} --apply" + (" --name NAME" if kind == "workplace" else ""))
+        is_git = (layer / ".git").exists()
+        remote = subprocess.run(["git", "-C", str(layer), "remote", "get-url", "origin"],
+                                capture_output=True, text=True).stdout.strip() if is_git else ""
+        add(f"{kind}-remote", "ok" if remote else "missing", remote or "no git remote, so no backup",
+            "create a private repo (e.g. gh repo create NAME --private) and cmem init-layer ... --remote URL --apply")
+    if configured():
+        add("claude-md-block", "ok" if BLOCK_RE.search(claude_md_text()) and OLD_BLOCK not in claude_md_text()
+            else "missing", home_path(CLAUDE_MD), "cmem sync --apply")
+        if WORKPLACE:
+            projects = sorted(CLAUDE_PROJECTS.iterdir()) if CLAUDE_PROJECTS.is_dir() else []
+            unlinked = [proj.name for proj in projects
+                        if (proj / "memory").is_dir() and not (proj / "memory").is_symlink()
+                        and any((proj / "memory").iterdir()) and "private-var" not in proj.name]
+            add("existing-memory", "missing" if unlinked else "ok",
+                f"{len(unlinked)} project memory folder(s) not in the workplace layer", "cmem link --all --apply")
+            skills = sorted(CLAUDE_SKILLS.iterdir()) if CLAUDE_SKILLS.is_dir() else []
+            personal = [skill.name for skill in skills
+                        if skill.is_dir() and not skill.is_symlink() and skill.name not in SKIP_SKILLS]
+            add("personal-skills", "missing" if personal else "ok",
+                f"{len(personal)} skill(s) in ~/.claude/skills not in a layer: {', '.join(personal)}",
+                "cmem skills --apply")
+    if remember_installed():
+        remember_config = REMEMBER_HOME / "config.json"
+        try:
+            data_dir = json.loads(remember_config.read_text()).get("data_dir")
+        except (OSError, ValueError):
+            data_dir = None
+        add("remember-notes", "ok" if data_dir == "~/.remember/{slug}" else "optional",
+            "remember plugin notes " + ("are kept in the layers" if data_dir == "~/.remember/{slug}"
+                                        else "stay in each checkout (not backed up)"), "cmem restore --apply")
+    add("shell-alias", "ok" if shutil.which("cmem") else "optional",
+        "`cmem` " + ("is on PATH" if shutil.which("cmem") else "is not on PATH (slash commands still work)"),
+        f"add to your shell rc: alias cmem='python3 {home_path(Path(__file__).resolve())}'")
+    settings = CLAUDE_DIR / "settings.json"
+    if running_as_plugin() and settings.exists() and "bin/cmem" in settings.read_text():
+        add("old-hook", "warn", "~/.claude/settings.json still runs cmem from a SessionStart hook; "
+            "the plugin does the same, so each session runs it twice", "remove that hook entry")
+    return items
+
+
+def cmd_doctor(args):
+    items = doctor_items()
+    if args.json:
+        print(json.dumps(items, indent=2))
+        return
+    for item in items:
+        print(f"{item['status'].upper():8} {item['key']:18} {item['detail']}")
+        if item["status"] in ("missing", "warn") and item["fix"]:
+            print(f"{'':27} fix: {item['fix']}")
+
+
+def cmd_remove(args):
+    """Undo cmem in this home folder: links become real folders again, cmem's CLAUDE.md block goes.
+    The layer repos and the config are kept, so `cmem sync` or /cmem:setup brings everything back."""
+    candidates = []
+    if CLAUDE_PROJECTS.is_dir():
+        candidates += [proj / "memory" for proj in sorted(CLAUDE_PROJECTS.iterdir())]
+    if REMEMBER_HOME.is_dir():
+        candidates += sorted(REMEMBER_HOME.iterdir())
+    if CLAUDE_SKILLS.is_dir():
+        candidates += sorted(CLAUDE_SKILLS.iterdir())
+    for link in candidates:
+        if not link.is_symlink():
+            continue
+        target = link_target(link)
+        if not inside_a_layer(target):
+            continue
+        say(f"unlink {home_path(link)}: put a copy of {rel(target)} in its place")
+        if APPLY:
+            link.unlink()
+            if target.is_dir():
+                shutil.copytree(target, link, symlinks=True)
+    text = claude_md_text()
+    if without_cmem_block(text) != text:
+        say(f"remove the cmem block from {rel(CLAUDE_MD)}")
+        if APPLY:
+            CLAUDE_MD.write_text(without_cmem_block(text))
+    if LESSONS_INDEX.exists():
+        say(f"delete {rel(LESSONS_INDEX)}")
+        if APPLY:
+            LESSONS_INDEX.unlink()
+    print("Kept: the layer repos and the cmem config. Lessons no longer load in every session.")
+
+
+def cmd_session_start(args):
+    """SessionStart hook. Prints nothing (it would land in the session's context) unless cmem is not set up."""
+    if os.environ.get("CMEM_DISABLE"):
+        return
+    if not configured():
+        print("cmem is installed but not set up. Tell the user once: run /cmem:setup to set it up.")
+        return
+    real_stdout = sys.stdout
+    sys.stdout = open(os.devnull, "w")
+    try:
+        project = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        if WORKPLACE and WORKPLACE.is_dir():
+            link_checkout(project)
+        cmd_sync(args)
+    except Exception as error:  # a hook must never break session start
+        sys.stdout = real_stdout
+        print(f"cmem: session-start step failed ({type(error).__name__}); run `cmem doctor` to check.")
+    finally:
+        sys.stdout = real_stdout
+
+
 def main():
     global APPLY
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -456,21 +757,46 @@ def main():
     restore.add_argument("--workplace", help="path of the workplace layer clone, e.g. ~/claude-memory-<name>")
     backup = sub.add_parser("backup")
     backup.add_argument("-m", "--message", default=f"cmem backup {datetime.date.today()}")
+    config = sub.add_parser("config", help="show or set the layer folders")
+    config.add_argument("--general", help="general layer folder, or 'none'")
+    config.add_argument("--workplace", help="workplace layer folder, or 'none'")
+    config.add_argument("--checkout-root", action="append",
+                        help="glob of folders holding your clones (repeatable), default: " + " ".join(DEFAULT_CHECKOUT_ROOTS))
+    init_layer = sub.add_parser("init-layer", help="create a layer's layout (only adds what is missing)")
+    init_layer.add_argument("kind", choices=("general", "workplace"))
+    init_layer.add_argument("path")
+    init_layer.add_argument("--name", help="workplace name (workplace layer)")
+    init_layer.add_argument("--owner", action="append", help="workplace GitHub org (repeatable)")
+    init_layer.add_argument("--remote", help="git URL of the layer's private repo")
+    doctor = sub.add_parser("doctor", help="list what is set up and what is missing")
+    doctor.add_argument("--json", action="store_true")
+    sub.add_parser("suggest-owners", help="GitHub orgs of your clones, most used first")
+    sub.add_parser("remove", help="undo cmem in this home folder; layer repos are kept")
+    sub.add_parser("session-start", help="what the plugin's SessionStart hook runs")
     for p in sub.choices.values():
         p.add_argument("--apply", action="store_true")
         p.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
-    APPLY = args.apply or args.cmd in ("backup", "check", "status")
+    if args.cmd == "init-layer" and args.kind == "workplace" and not args.name:
+        parser.error("init-layer workplace needs --name")
+    APPLY = args.apply or args.cmd in ("backup", "check", "status", "doctor", "session-start", "suggest-owners")
     if args.quiet:
         sys.stdout = open(os.devnull, "w")
+    needs_setup = args.cmd in ("link", "skills", "promote", "sync", "check", "status", "backup")
+    if needs_setup and not configured():
+        print("cmem is not set up yet: run /cmem:setup in Claude Code, or `cmem doctor` to see what is missing.")
+        sys.exit(1)
     needs_workplace = args.cmd in ("link", "skills", "promote")
     if needs_workplace and not WORKPLACE:
         print("No workplace layer configured; nothing to link.")
         return
     commands = {"link": cmd_link, "skills": cmd_skills, "promote": cmd_promote, "sync": cmd_sync,
-                "check": cmd_check, "status": cmd_status, "backup": cmd_backup, "restore": cmd_restore}
+                "check": cmd_check, "status": cmd_status, "backup": cmd_backup, "restore": cmd_restore,
+                "config": cmd_config, "init-layer": cmd_init_layer, "doctor": cmd_doctor, "remove": cmd_remove,
+                "session-start": cmd_session_start,
+                "suggest-owners": lambda _: print("\n".join(github_owners_of_checkouts()))}
     ok = commands[args.cmd](args)
-    if APPLY and BACKUP_DIR.exists():
+    if APPLY and BACKUP_DIR.exists() and args.cmd != "session-start":
         print(f"Originals copied to {BACKUP_DIR}")
     if args.cmd == "check" and not ok:
         sys.exit(1)

@@ -1,0 +1,16 @@
+{
+  "name": "cmem",
+  "owner": {
+    "name": "Roei Goldenberg"
+  },
+  "metadata": {
+    "description": "cmem: Claude Code memory, lessons and skills kept in git across clones, machines and jobs."
+  },
+  "plugins": [
+    {
+      "name": "cmem",
+      "source": "./",
+      "description": "Keep Claude Code memory, lessons and skills in git: a personal layer that travels with you and a workplace layer."
+    }
+  ]
+}

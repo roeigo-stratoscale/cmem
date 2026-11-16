@@ -1,0 +1,8 @@
+{
+  "name": "cmem",
+  "version": "0.1.0",
+  "description": "Keep Claude Code memory, lessons and skills in git: a personal layer that travels with you and a workplace layer, shared by every clone and restorable on a new machine.",
+  "author": {"name": "Roei Goldenberg"},
+  "license": "MIT",
+  "repository": "https://github.com/roeigo-stratoscale/cmem"
+}
